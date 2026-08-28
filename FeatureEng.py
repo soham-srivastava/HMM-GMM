@@ -4,8 +4,9 @@ import numpy as np
 from ta import add_all_ta_features
 from statsmodels.tsa.stattools import adfuller
 
+
 def engineer_features(data_df, num_lead):
-    """Engineers technical features and ensures stationarity."""
+    'Enginner Technical feature and encure stationaruty'
     # Note: The 'returns' column is expected to be present from get_data function.
 
     # Create a new DataFrame with the same index as the input DataFrame for TA feature calculation
@@ -47,7 +48,7 @@ def engineer_features(data_df, num_lead):
             continue
             
         # Perform the Augmented Dickey-Fuller test
-        pvalue = adfuller(indicator_series, regression='c', autolag='AIC')[1]
+        pvalue = adfuller(indicator_series, regression='ct', autolag='AIC')[1]
         
         # Check if the series is non-stationary
         if pvalue > 0.05:
@@ -68,7 +69,7 @@ def engineer_features(data_df, num_lead):
     data_with_all_features = pd.concat([data_df, processed_features_df], axis=1)
 
     # Define the prediction target 'y_signal'
-    data_with_all_features['y_signal'] = np.where(data_with_all_features['returns'].shift(-num_lead)>0,1,0)
+    data_with_all_features['y_signal'] = np.where(data_with_all_features['returns'].shift(-num_lead)>0,1,-1)
     
     # Identify the final list of feature columns
     final_feature_columns = [col for col in processed_features_df.columns if col in data_with_all_features.columns]

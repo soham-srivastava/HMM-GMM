@@ -14,7 +14,7 @@ import pyfolio.timeseries as pf_ts
 
 
 
-from Backtester import run_backtest
+from Strategy import run_backtest
 from FeatureEng import engineer_features
 from PlotMetric import plot_results
 from Metric_display import compute_perf_stats
