@@ -1,1 +1,6 @@
 __pycache__/
+tcs_data copy.csv
+data_cache/
+reports/
+_old/
+.DS_Store

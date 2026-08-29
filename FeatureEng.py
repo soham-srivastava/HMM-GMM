@@ -1,76 +1,140 @@
-# Define a function to engineer technical features and ensure stationarity
-import pandas as pd
+"""
+Causal feature engineering.
+
+Two rules:
+  1. The transform plan is fitted ONCE on data before STATIONARITY_FIT_END and
+     frozen.  Applying it (pct_change / diff) only looks backwards, so no
+     future information reaches a past feature.
+  2. pct_change does not guarantee stationarity, so every series is re-tested
+     after transformation.  ADF decides; KPSS is reported next to it.
+"""
+
+import warnings
 import numpy as np
+import pandas as pd
+from statsmodels.tsa.stattools import adfuller, kpss
 from ta import add_all_ta_features
-from statsmodels.tsa.stattools import adfuller
+
+from config import ADF_PVALUE, DROP_NONSTATIONARY, VOL_WINDOW, HMM_FEATURES
+
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
-def engineer_features(data_df, num_lead):
-    'Enginner Technical feature and encure stationaruty'
-    # Note: The 'returns' column is expected to be present from get_data function.
+def add_ta_block(df):
+    """The ~85 `ta` indicators, with the raw OHLCV columns stripped back out."""
+    px = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce").astype(float)
+                       for c in OHLCV}, index=df.index)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        feats = add_all_ta_features(px, open="Open", high="High", low="Low",
+                                    close="Close", volume="Volume", fillna=True)
+    return feats.drop(columns=OHLCV, errors="ignore")
 
-    # Create a new DataFrame with the same index as the input DataFrame for TA feature calculation
-    df_input_for_ta = pd.DataFrame(index=data_df.index)
-    # Copy 'Open', 'High', 'Low', 'Close', and 'Volume' prices, casting to float
-    df_input_for_ta['Open'] = data_df['Open'].astype(float)
-    df_input_for_ta['High'] = data_df['High'].astype(float)
-    df_input_for_ta['Low'] = data_df['Low'].astype(float)
-    df_input_for_ta['Close'] = data_df['Close'].astype(float)
-    df_input_for_ta['Volume'] = data_df['Volume'].astype(float)
 
-    # Add all technical analysis features using the 'ta' library
-    features_added_df = add_all_ta_features(
-        df_input_for_ta,
-        open="Open",
-        high="High",
-        low="Low",
-        close="Close",
-        volume="Volume",
-        fillna=True
-    )
+def _test(s):
+    """(ADF p, KPSS p). ADF null = unit root; KPSS null = stationary."""
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < 40 or s.nunique() < 3:
+        return np.nan, np.nan
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            a = adfuller(s, regression="ct", autolag="AIC")[1]
+        except Exception:
+            a = np.nan
+        try:
+            k = kpss(s, regression="c", nlags="auto")[1]
+        except Exception:
+            k = np.nan
+    return a, k
 
-    # Define a list of original OHLCV columns to remove from the TA features DataFrame
-    columns_to_drop_from_ta_output = ["Open", "High", "Low", "Close", "Volume"]
-    # Drop the original OHLCV columns to keep only the TA features
-    processed_features_df = features_added_df.drop(columns=columns_to_drop_from_ta_output, errors='ignore')
 
-    # Initialize lists to categorize indicators
-    indicators_to_become_stationary = []
-    indicators_to_drop = []
+def fit_transform_plan(raw, fit_index):
+    """Decide each feature's transform using only rows in `fit_index`."""
+    plan, rows = {}, []
+    fit = raw.loc[raw.index.isin(fit_index)]
 
-    # Loop through each indicator to check for stationarity
-    for indicator in processed_features_df.columns:
-        indicator_series = processed_features_df[indicator].replace([np.inf, -np.inf], np.nan).dropna()
-        
-        # Drop indicators with insufficient data for the ADF test
-        if len(indicator_series) < 20:
-            indicators_to_drop.append(indicator)
+    for col in raw.columns:
+        s = fit[col]
+        if s.dropna().nunique() <= 2:                    # 0/1 flags are stationary
+            plan[col] = "raw"
+            rows.append((col, "raw", np.nan, np.nan, "binary flag"))
             continue
-            
-        # Perform the Augmented Dickey-Fuller test
-        pvalue = adfuller(indicator_series, regression='ct', autolag='AIC')[1]
-        
-        # Check if the series is non-stationary
-        if pvalue > 0.05:
-            indicators_to_become_stationary.append(indicator)
-        # Drop indicators where the p-value calculation fails
-        elif np.isnan(pvalue):
-            indicators_to_drop.append(indicator)
 
-    # Make non-stationary indicators stationary using percentage change
-    if indicators_to_become_stationary:
-        processed_features_df.loc[:, indicators_to_become_stationary] = processed_features_df[indicators_to_become_stationary].pct_change()
+        adf0, kpss0 = _test(s)
+        if np.isnan(adf0):
+            plan[col] = "drop"
+            rows.append((col, "drop", adf0, kpss0, "untestable"))
+            continue
 
-    # Drop indicators marked for removal
-    if indicators_to_drop:
-        processed_features_df.drop(columns=indicators_to_drop, inplace=True, errors='ignore')
+        if adf0 < ADF_PVALUE:
+            plan[col] = "raw"
+            rows.append((col, "raw", adf0, kpss0, "stationary as-is"))
+            continue
 
-    # Concatenate the original data with the new features
-    data_with_all_features = pd.concat([data_df, processed_features_df], axis=1)
+        # non-stationary: pct_change if strictly positive, else first difference
+        kind = "pct_change" if (s.dropna() > 0).all() else "diff"
+        t = (s.pct_change() if kind == "pct_change" else s.diff())
+        adf1, _ = _test(t.replace([np.inf, -np.inf], np.nan))
+        if not np.isnan(adf1) and adf1 < ADF_PVALUE:
+            plan[col] = kind
+            rows.append((col, kind, adf0, adf1, "stationary after transform"))
+        elif DROP_NONSTATIONARY:
+            plan[col] = "drop"
+            rows.append((col, "drop", adf0, adf1, "still non-stationary"))
+        else:
+            plan[col] = kind
+            rows.append((col, kind, adf0, adf1, "kept (weak)"))
 
-    # Define the prediction target 'y_signal'
-    data_with_all_features['y_signal'] = np.where(data_with_all_features['returns'].shift(-num_lead)>0,1,-1)
-    
-    # Identify the final list of feature columns
-    final_feature_columns = [col for col in processed_features_df.columns if col in data_with_all_features.columns]
-    return data_with_all_features, final_feature_columns
+    report = pd.DataFrame(rows, columns=["feature", "transform", "adf_p_before",
+                                         "adf_p_after", "status"]).set_index("feature")
+    return plan, report
+
+
+def apply_transform_plan(raw, plan):
+    out = {}
+    for col, kind in plan.items():
+        if kind == "drop" or col not in raw:
+            continue
+        s = raw[col]
+        if kind == "pct_change":
+            s = s.pct_change()
+        elif kind == "diff":
+            s = s.diff()
+        out[col] = s.replace([np.inf, -np.inf], np.nan)
+    return pd.DataFrame(out, index=raw.index)
+
+
+def build_hmm_features(df):
+    """
+    What the regime model observes.  Deliberately small: an HMM is a density
+    model, and 85 correlated indicators would make it unidentifiable.
+    """
+    cols = {"returns": df["returns"]}
+    if "vol" in HMM_FEATURES:
+        cols["vol"] = df["returns"].rolling(VOL_WINDOW).std()
+    return pd.DataFrame({k: cols[k] for k in HMM_FEATURES}, index=df.index)
+
+
+def engineer_features(df, num_lead, fit_end=None, plan=None):
+    """
+    Returns (data, feature_cols, hmm_cols, report).
+
+    Label: y_t = 1[ Close_{t+num_lead}/Close_t - 1 > 0 ].
+    """
+    raw = add_ta_block(df)
+    if plan is None:
+        idx = raw.index[raw.index < pd.to_datetime(fit_end)]
+        plan, report = fit_transform_plan(raw, idx)
+    else:
+        report = pd.DataFrame()
+
+    features = apply_transform_plan(raw, plan)
+    hmm = build_hmm_features(df)
+    out = pd.concat([df, features, hmm.drop(columns=["returns"], errors="ignore")], axis=1)
+
+    fwd = out["Close"].shift(-num_lead) / out["Close"] - 1.0
+    out["y_signal"] = np.where(fwd > 0, 1.0, 0.0)
+    out.loc[fwd.isna(), "y_signal"] = np.nan          # unknowable labels stay NaN
+
+    return out, list(features.columns), list(hmm.columns), {"plan": plan, "report": report}
